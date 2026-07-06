@@ -15,48 +15,12 @@ import threading
 
 # ====== 核心计数（同V5，不动） ======
 
-def count_peaches(img_bgr, mode="ripe"):
-    h, w = img_bgr.shape[:2]
-    scale = 1200 / max(h, w)
-    if scale < 1:
-        new_w, new_h = int(w * scale), int(h * scale)
-        img = cv2.resize(img_bgr, (new_w, new_h))
-    else:
-        img = img_bgr.copy()
-
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    if mode == "ripe":
-        lower1 = np.array([0, 30, 40])
-        upper1 = np.array([25, 255, 255])
-        lower2 = np.array([35, 40, 40])
-        upper2 = np.array([85, 255, 255])
-        lower3 = np.array([10, 20, 20])
-        upper3 = np.array([35, 150, 150])
-        area_min, circ_min = 150, 0.3
-    elif mode == "green":
-        lower1 = np.array([0, 20, 20])
-        upper1 = np.array([30, 255, 255])
-        lower2 = np.array([20, 20, 20])
-        upper2 = np.array([95, 200, 255])
-        lower3 = np.array([5, 10, 10])
-        upper3 = np.array([40, 100, 130])
-        area_min, circ_min = 80, 0.25
-    else:
-        # auto ≡ ripe（实际测试 ripe 模式表现最稳）
-        mode = "ripe"
-        lower1 = np.array([0, 30, 40])
-        upper1 = np.array([25, 255, 255])
-        lower2 = np.array([35, 40, 40])
-        upper2 = np.array([85, 255, 255])
-        lower3 = np.array([10, 20, 20])
-        upper3 = np.array([35, 150, 150])
-        area_min, circ_min = 150, 0.3
-
-    mask = (cv2.inRange(hsv, lower1, upper1) |
-            cv2.inRange(hsv, lower2, upper2) |
-            cv2.inRange(hsv, lower3, upper3))
-
+def _detect_fruits(hsv, lower1, upper1, lower2, upper2, lower3, upper3,
+                   area_min, circ_min, aspect_min=0.5):
+    """通用检测：三路HSV合并 + 形态学 + 形状过滤，返回轮廓列表"""
+    mask = (cv2.inRange(hsv, np.array(lower1), np.array(upper1)) |
+            cv2.inRange(hsv, np.array(lower2), np.array(upper2)) |
+            cv2.inRange(hsv, np.array(lower3), np.array(upper3)))
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -73,18 +37,99 @@ def count_peaches(img_bgr, mode="ripe"):
         if 4 * np.pi * area / (perimeter * perimeter) < circ_min:
             continue
         xb, yb, wb, hb = cv2.boundingRect(c)
-        if min(wb, hb) / max(wb, hb) < 0.5:
+        if min(wb, hb) / max(wb, hb) < aspect_min:
             continue
         fruits.append(c)
+    return fruits
 
+
+def _dedup_contours(contours):
+    """按中心点去重"""
     seen = set()
     unique = []
-    for c in fruits:
+    for c in contours:
         xb, yb, wb, hb = cv2.boundingRect(c)
         center = ((xb + wb // 2) % 10000, (yb + hb // 2) % 10000)
         if center not in seen:
             seen.add(center)
             unique.append(c)
+    return unique
+
+
+def _detect_lab(img_bgr):
+    """Lab色彩空间分割：a>130 且 b>130 → 落果偏红偏黄"""
+    h, w = img_bgr.shape[:2]
+    scale = 1200 / max(h, w)
+    if scale < 1:
+        img = cv2.resize(img_bgr, (int(w * scale), int(h * scale)))
+    else:
+        img = img_bgr.copy()
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    # 落果偏红(a高)偏黄(b高)，双条件同时满足
+    _, a_mask = cv2.threshold(a, 130, 255, cv2.THRESH_BINARY)
+    _, b_mask = cv2.threshold(b, 130, 255, cv2.THRESH_BINARY)
+    mask = cv2.bitwise_and(a_mask, b_mask)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    fruits = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if not (100 < area < 30000):
+            continue
+        perimeter = cv2.arcLength(c, True)
+        if perimeter == 0:
+            continue
+        if 4 * np.pi * area / (perimeter * perimeter) < 0.25:
+            continue
+        xb, yb, wb, hb = cv2.boundingRect(c)
+        if min(wb, hb) / max(wb, hb) < 0.4:
+            continue
+        fruits.append(c)
+    return fruits
+
+
+def count_peaches(img_bgr, mode="ripe"):
+    h, w = img_bgr.shape[:2]
+    scale = 1200 / max(h, w)
+    if scale < 1:
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = cv2.resize(img_bgr, (new_w, new_h))
+    else:
+        img = img_bgr.copy()
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    if mode == "ripe":
+        fruits = _detect_fruits(hsv,
+            [0, 30, 40], [25, 255, 255],
+            [35, 40, 40], [85, 255, 255],
+            [10, 20, 20], [35, 150, 150],
+            area_min=150, circ_min=0.3)
+    elif mode == "green":
+        fruits = _detect_fruits(hsv,
+            [0, 20, 20], [30, 255, 255],
+            [20, 20, 20], [95, 200, 255],
+            [5, 10, 10], [40, 180, 200],
+            area_min=80, circ_min=0.25)
+    else:  # auto = 自动择优：HSV合并 vs Lab，取结果多的
+        f1 = _detect_fruits(hsv,
+            [0, 30, 40], [25, 255, 255],
+            [35, 40, 40], [85, 255, 255],
+            [10, 20, 20], [35, 150, 150],
+            area_min=150, circ_min=0.3)
+        f2 = _detect_fruits(hsv,
+            [0, 20, 20], [30, 255, 255],
+            [20, 20, 20], [95, 200, 255],
+            [5, 10, 10], [40, 180, 200],
+            area_min=80, circ_min=0.25)
+        hsv_fruits = _dedup_contours(f1 + f2)
+        lab_fruits = _detect_lab(img)
+        fruits = hsv_fruits if len(hsv_fruits) >= len(lab_fruits) else lab_fruits
+
+    unique = _dedup_contours(fruits)
     return _draw_result(img, unique)
 
 def _count_auto(img):
