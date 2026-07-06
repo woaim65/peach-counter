@@ -43,7 +43,15 @@ def count_peaches(img_bgr, mode="ripe"):
         upper3 = np.array([40, 100, 130])
         area_min, circ_min = 80, 0.25
     else:
-        return _count_auto(img)
+        # auto ≡ ripe（实际测试 ripe 模式表现最稳）
+        mode = "ripe"
+        lower1 = np.array([0, 30, 40])
+        upper1 = np.array([25, 255, 255])
+        lower2 = np.array([35, 40, 40])
+        upper2 = np.array([85, 255, 255])
+        lower3 = np.array([10, 20, 20])
+        upper3 = np.array([35, 150, 150])
+        area_min, circ_min = 150, 0.3
 
     mask = (cv2.inRange(hsv, lower1, upper1) |
             cv2.inRange(hsv, lower2, upper2) |
